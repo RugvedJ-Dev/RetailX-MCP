@@ -1,26 +1,53 @@
 import datetime
 import os
 from contextlib import contextmanager
+from functools import lru_cache
 
 import psycopg2
 from fastmcp import FastMCP
 from psycopg2.extras import RealDictCursor
-
-DATABASE_URL = os.environ.get("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError(
-        "DATABASE_URL is not set. Example: postgresql://user:password@host:5432/dbname"
-    )
 
 CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
 mcp = FastMCP("ExpenseTracker")
 
 
+def _connect():
+    """Read DATABASE_URL at call time (not at import) and open a connection."""
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Example: postgresql://user:password@host:5432/dbname"
+        )
+    return psycopg2.connect(url)
+
+
+@lru_cache(maxsize=1)
+def init_db():
+    """Create the table once, on first use. Failures are not cached, so it retries."""
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS expenses(
+                    id SERIAL PRIMARY KEY,
+                    date DATE NOT NULL,
+                    amount DOUBLE PRECISION NOT NULL,
+                    category TEXT NOT NULL,
+                    subcategory TEXT DEFAULT '',
+                    note TEXT DEFAULT ''
+                )
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @contextmanager
 def get_conn():
     """Open a connection, commit on success, rollback on error, always close."""
-    conn = psycopg2.connect(str(DATABASE_URL))
+    init_db()
+    conn = _connect()
     try:
         yield conn
         conn.commit()
@@ -29,23 +56,6 @@ def get_conn():
         raise
     finally:
         conn.close()
-
-
-def init_db():
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS expenses(
-                id SERIAL PRIMARY KEY,
-                date DATE NOT NULL,
-                amount DOUBLE PRECISION NOT NULL,
-                category TEXT NOT NULL,
-                subcategory TEXT DEFAULT '',
-                note TEXT DEFAULT ''
-            )
-        """)
-
-
-init_db()
 
 
 @mcp.tool()
