@@ -1,2 +1,50 @@
-.venv/
+# Environment variables and secrets (contains DATABASE_URL)
 .env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# uv
+.uv/
+# uv.lock is usually committed for apps; remove the next line if you want to track it
+# uv.lock
+
+# Local SQLite database from the original version (not needed with PostgreSQL)
+*.db
+*.sqlite3
+
+# Testing / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
