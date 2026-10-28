@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "Rugved", email = "rugvedjadhao122004.dev@gmail.com" }
 ]
-requires-python = ">=3.15"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "fastmcp>=4.1.4",
     "psycopg2-binary>=2.9.13",
