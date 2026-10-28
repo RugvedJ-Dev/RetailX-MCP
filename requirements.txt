@@ -1,0 +1,2 @@
+fastmcp
+psycopg2-binary
