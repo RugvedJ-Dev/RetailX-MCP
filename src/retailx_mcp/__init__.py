@@ -1,173 +1,545 @@
-from fastmcp import FastMCP
-import psycopg2
-from psycopg2.extras import RealDictCursor
 import os
+import logging
+import sqlite3
+from pathlib import Path
 from datetime import date
-from typing import Dict, List, Any
+from typing import Optional
 
-# Initialize FastMCP server
+import aiosqlite
+from dotenv import load_dotenv
+from fastmcp import FastMCP
+
+
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+load_dotenv(PROJECT_ROOT / ".env")
+
+DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_PATH = DATA_DIR / "sales.db"
+
+# For this version, one configured shop uses this database scope.
+# Do not let the LLM choose this value.
+SHOP_ID = os.getenv("SHOP_ID", "default-shop")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("sales-mcp")
+
 mcp = FastMCP("SalesManagementServer")
 
-def get_db_connection():
-    db_url = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/sales_db")
-    return psycopg2.connect(db_url, cursor_factory=RealDictCursor)
 
-@mcp.tool()
-def add_sale(username: str, amount: float, sale_date: str, item_name: str, quantity: int = 1) -> str:
-    """
-    Adds a new sale record into the PostgreSQL sales database for a specific user.
+# --------------------------------------------------
+# Database initialization
+# --------------------------------------------------
 
-    Args:
-        username: The unique username of the user recording the sale.
-        amount: The total monetary amount or price of the sale (e.g., 150.50).
-        sale_date: The date when the sale occurred in exact YYYY-MM-DD format.
-        item_name: The name, description, or title of the product or service sold.
-        quantity: The quantity of items sold (defaults to 1 if not specified).
+def initialize_database():
+    """Create tables/indexes. Runs at import time so it also works
+    when the server is started with `fastmcp run`."""
 
-    Returns:
-        A success confirmation message string indicating the sale has been saved.
-    """
+    with sqlite3.connect(DB_PATH) as db:
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS sales (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                shop_id TEXT NOT NULL,
+                sale_date TEXT NOT NULL,
+                product TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                unit_price REAL NOT NULL,
+                total_amount REAL NOT NULL,
+                customer TEXT,
+                category TEXT,
+                note TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sales_shop_date
+            ON sales(shop_id, sale_date)
+        """)
+
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sales_shop_product
+            ON sales(shop_id, product)
+        """)
+
+        db.commit()
+
+
+initialize_database()
+
+
+async def get_db():
+
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+
+    return db
+
+
+# --------------------------------------------------
+# Validation helpers
+# --------------------------------------------------
+
+def validate_date(value: str) -> str:
+    """Validate and normalize an ISO date."""
+
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO sales (username, sale_date, amount, item_name, quantity) VALUES (%s, %s, %s, %s, %s)",
-            (username, sale_date, amount, item_name, quantity)
+        return date.fromisoformat(value).isoformat()
+    except (TypeError, ValueError):
+        raise ValueError("Date must use YYYY-MM-DD format.")
+
+
+def validate_date_range(start_date, end_date):
+
+    if start_date:
+        start_date = validate_date(start_date)
+
+    if end_date:
+        end_date = validate_date(end_date)
+
+    if start_date and end_date and start_date > end_date:
+        raise ValueError("start_date cannot be after end_date.")
+
+    return start_date, end_date
+
+
+def validate_number_range(low, high, label):
+
+    if low is not None and high is not None and low > high:
+        raise ValueError(
+            f"min_{label} cannot be greater than max_{label}."
         )
-        conn.commit()
-        cur.close()
-        conn.close()
-        return f"Successfully recorded sale of ${amount} for item '{item_name}' on {sale_date} for user {username}."
-    except Exception as e:
-        return f"Error adding sale to database: {str(e)}"
+
+
+def apply_filters(
+    query: str,
+    params: list,
+    start_date=None,
+    end_date=None,
+    product=None,
+    min_amount=None,
+    max_amount=None,
+    min_unit_price=None,
+    max_unit_price=None,
+):
+    """Append optional WHERE conditions to a query."""
+
+    if start_date:
+        query += " AND sale_date >= ?"
+        params.append(start_date)
+
+    if end_date:
+        query += " AND sale_date <= ?"
+        params.append(end_date)
+
+    if product:
+        query += " AND product LIKE ?"
+        params.append(f"%{product}%")
+
+    if min_amount is not None:
+        query += " AND total_amount >= ?"
+        params.append(min_amount)
+
+    if max_amount is not None:
+        query += " AND total_amount <= ?"
+        params.append(max_amount)
+
+    if min_unit_price is not None:
+        query += " AND unit_price >= ?"
+        params.append(min_unit_price)
+
+    if max_unit_price is not None:
+        query += " AND unit_price <= ?"
+        params.append(max_unit_price)
+
+    return query, params
+
+
+# --------------------------------------------------
+# Add sale
+# --------------------------------------------------
 
 @mcp.tool()
-def get_sales_by_date(username: str, sale_date: str) -> List[Dict[str, Any]]:
+async def add_sale(
+    product: str,
+    quantity: int,
+    unit_price: float,
+    sale_date: Optional[str] = None,
+    customer: Optional[str] = None,
+    category: Optional[str] = None,
+    note: Optional[str] = None,
+) -> dict:
     """
-    Retrieves all sales transactions for a specific user on an exact single date from the PostgreSQL database.
+    Record a new sale.
 
-    Args:
-        username: The unique username whose sales records are to be retrieved.
-        sale_date: The exact date to query in YYYY-MM-DD format.
-
-    Returns:
-        A list of dictionaries containing sale details (id, sale_date, amount, item_name, quantity) for that date.
+    Provide product name, quantity, unit price and optionally
+    sale date, customer, category and note.
     """
+
+    if not product or not product.strip():
+        raise ValueError("Product name cannot be empty.")
+
+    if quantity <= 0:
+        raise ValueError("Quantity must be greater than zero.")
+
+    if unit_price < 0:
+        raise ValueError("Unit price cannot be negative.")
+
+    if sale_date is None:
+        sale_date = date.today().isoformat()
+    else:
+        sale_date = validate_date(sale_date)
+
+    total_amount = round(quantity * unit_price, 2)
+
+    db = await get_db()
+
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, sale_date, amount, item_name, quantity FROM sales WHERE username = %s AND sale_date = %s ORDER BY sale_date DESC",
-            (username, sale_date)
-        )
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        results: List[Dict[str, Any]] = []
-        for row in rows:
-            r: Dict[str, Any] = dict(row) # type: ignore
-            d = r.get('sale_date')
-            if isinstance(d, date):
-                r['sale_date'] = d.isoformat()
-            if r.get('amount') is not None:
-                r['amount'] = float(r['amount'])
-            results.append(r)
-        return results
-    except Exception as e:
-        return [{"error": str(e)}]
-
-@mcp.tool()
-def get_sales_range(username: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
-    """
-    Retrieves all sales records for a specific user within a date range (inclusive) from the PostgreSQL database.
-    Use this when the user asks for sales from a particular starting day to a particular ending day.
-
-    Args:
-        username: The unique username whose sales records are requested.
-        start_date: The beginning date of the range in YYYY-MM-DD format.
-        end_date: The ending date of the range in YYYY-MM-DD format.
-
-    Returns:
-        A list of dictionaries representing all sales made between start_date and end_date.
-    """
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, sale_date, amount, item_name, quantity FROM sales WHERE username = %s AND sale_date BETWEEN %s AND %s ORDER BY sale_date ASC",
-            (username, start_date, end_date)
-        )
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        results: List[Dict[str, Any]] = []
-        for row in rows:
-            r: Dict[str, Any] = dict(row) # type: ignore
-            d = r.get('sale_date')
-            if isinstance(d, date):
-                r['sale_date'] = d.isoformat()
-            if r.get('amount') is not None:
-                r['amount'] = float(r['amount'])
-            results.append(r)
-        return results
-    except Exception as e:
-        return [{"error": str(e)}]
-
-@mcp.tool()
-def get_sales_chart_data(username: str, start_date: str, end_date: str) -> Dict[str, Any]:
-    """
-    Aggregates and formats sales data points specifically for visualization (line charts) across a given date range.
-    Use this tool when the user requests to visualize, plot, or graph their sales over a time period.
-
-    Args:
-        username: The unique username requesting the chart visualization data.
-        start_date: The start date of the visualization period in YYYY-MM-DD format.
-        end_date: The end date of the visualization period in YYYY-MM-DD format.
-
-    Returns:
-        A dictionary containing structured data points with 'x_axis' (dates) and 'y_axis' (total sales amounts) ready for plotting.
-    """
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
+        cursor = await db.execute(
             """
-            SELECT sale_date, SUM(amount) as total_amount
-            FROM sales
-            WHERE username = %s AND sale_date BETWEEN %s AND %s
-            GROUP BY sale_date
-            ORDER BY sale_date ASC
+            INSERT INTO sales (
+                shop_id,
+                sale_date,
+                product,
+                quantity,
+                unit_price,
+                total_amount,
+                customer,
+                category,
+                note
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (username, start_date, end_date)
+            (
+                SHOP_ID,
+                sale_date,
+                product.strip(),
+                quantity,
+                unit_price,
+                total_amount,
+                customer,
+                category,
+                note,
+            ),
         )
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
 
-        dates: List[str] = []
-        amounts: List[float] = []
-        for row in rows:
-            r: Dict[str, Any] = dict(row) # type: ignore
-            d = r.get('sale_date')
-            if isinstance(d, date):
-                dates.append(d.isoformat())
-            elif d is not None:
-                dates.append(str(d))
-
-            tot = r.get('total_amount')
-            if tot is not None:
-                amounts.append(float(tot))
+        await db.commit()
 
         return {
-            "chart_type": "line",
-            "x_axis": dates,
-            "y_axis": amounts,
-            "summary": f"Retrieved chart data from {start_date} to {end_date} with {len(dates)} data points."
+            "success": True,
+            "sale_id": cursor.lastrowid,
+            "product": product,
+            "quantity": quantity,
+            "total_amount": total_amount,
+            "sale_date": sale_date,
+            "message": "Sale successfully recorded.",
         }
-    except Exception as e:
-        return {"error": str(e)}
+
+    finally:
+        await db.close()
+
+
+# --------------------------------------------------
+# Retrieve sales
+# --------------------------------------------------
+
+@mcp.tool()
+async def get_sales(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    product: Optional[str] = None,
+    min_amount: Optional[float] = None,
+    max_amount: Optional[float] = None,
+    min_unit_price: Optional[float] = None,
+    max_unit_price: Optional[float] = None,
+    limit: int = 500,
+) -> dict:
+    """
+    Retrieve sales records with optional filters.
+
+    Filters:
+    - start_date / end_date: YYYY-MM-DD
+    - product: product name (partial match)
+    - min_amount / max_amount: filter on the TOTAL amount of the
+      sale (quantity x unit price). Use this for requests like
+      "sales of 70 rupees or less" (max_amount=70).
+    - min_unit_price / max_unit_price: filter on the price of ONE
+      unit. Use only when the user explicitly says per unit.
+    - limit: maximum number of records
+    """
+
+    if limit < 1 or limit > 5000:
+        raise ValueError("Limit must be between 1 and 5000.")
+
+    start_date, end_date = validate_date_range(start_date, end_date)
+
+    validate_number_range(min_amount, max_amount, "amount")
+    validate_number_range(
+        min_unit_price, max_unit_price, "unit_price"
+    )
+
+    query = """
+        SELECT
+            id,
+            sale_date,
+            product,
+            quantity,
+            unit_price,
+            total_amount,
+            customer,
+            category,
+            note
+        FROM sales
+        WHERE shop_id = ?
+    """
+
+    query, params = apply_filters(
+        query,
+        [SHOP_ID],
+        start_date,
+        end_date,
+        product,
+        min_amount,
+        max_amount,
+        min_unit_price,
+        max_unit_price,
+    )
+
+    query += " ORDER BY sale_date DESC, id DESC LIMIT ?"
+    params.append(limit)
+
+    db = await get_db()
+
+    try:
+        cursor = await db.execute(query, params)
+        rows = await cursor.fetchall()
+
+        records = [dict(row) for row in rows]
+
+        return {
+            "count": len(records),
+            "sales": records,
+        }
+
+    finally:
+        await db.close()
+
+
+# --------------------------------------------------
+# Sales summary
+# --------------------------------------------------
+
+@mcp.tool()
+async def sales_summary(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    min_amount: Optional[float] = None,
+    max_amount: Optional[float] = None,
+) -> dict:
+    """
+    Calculate sales summary for a date range, optionally limited to
+    sales whose total amount is between min_amount and max_amount.
+
+    Returns total revenue, number of transactions,
+    units sold and average transaction value.
+    """
+
+    start_date, end_date = validate_date_range(start_date, end_date)
+
+    validate_number_range(min_amount, max_amount, "amount")
+
+    query = """
+        SELECT
+            COALESCE(SUM(total_amount), 0) AS total_revenue,
+            COUNT(*) AS total_transactions,
+            COALESCE(SUM(quantity), 0) AS units_sold,
+            COALESCE(AVG(total_amount), 0) AS average_transaction
+        FROM sales
+        WHERE shop_id = ?
+    """
+
+    query, params = apply_filters(
+        query,
+        [SHOP_ID],
+        start_date,
+        end_date,
+        min_amount=min_amount,
+        max_amount=max_amount,
+    )
+
+    db = await get_db()
+
+    try:
+        cursor = await db.execute(query, params)
+        row = await cursor.fetchone()
+
+        return {
+            "total_revenue": round(row["total_revenue"], 2),
+            "total_transactions": row["total_transactions"],
+            "units_sold": row["units_sold"],
+            "average_transaction": round(
+                row["average_transaction"], 2
+            ),
+            "start_date": start_date,
+            "end_date": end_date,
+            "min_amount": min_amount,
+            "max_amount": max_amount,
+        }
+
+    finally:
+        await db.close()
+
+
+# --------------------------------------------------
+# Sales trend
+# --------------------------------------------------
+
+@mcp.tool()
+async def get_sales_trend(
+    start_date: str,
+    end_date: str,
+    min_amount: Optional[float] = None,
+    max_amount: Optional[float] = None,
+) -> dict:
+    """
+    Retrieve daily revenue between two dates, optionally limited to
+    sales whose total amount is between min_amount and max_amount.
+    Useful for generating sales trend charts.
+    """
+
+    start_date = validate_date(start_date)
+    end_date = validate_date(end_date)
+
+    if start_date > end_date:
+        raise ValueError("start_date cannot be after end_date.")
+
+    validate_number_range(min_amount, max_amount, "amount")
+
+    query = """
+        SELECT
+            sale_date,
+            SUM(total_amount) AS revenue,
+            SUM(quantity) AS units_sold,
+            COUNT(*) AS transactions
+        FROM sales
+        WHERE shop_id = ?
+          AND sale_date BETWEEN ? AND ?
+    """
+
+    query, params = apply_filters(
+        query,
+        [SHOP_ID, start_date, end_date],
+        min_amount=min_amount,
+        max_amount=max_amount,
+    )
+
+    query += """
+        GROUP BY sale_date
+        ORDER BY sale_date ASC
+    """
+
+    db = await get_db()
+
+    try:
+        cursor = await db.execute(query, params)
+
+        rows = await cursor.fetchall()
+
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "min_amount": min_amount,
+            "max_amount": max_amount,
+            "trend": [
+                {
+                    "date": row["sale_date"],
+                    "revenue": round(row["revenue"], 2),
+                    "units_sold": row["units_sold"],
+                    "transactions": row["transactions"],
+                }
+                for row in rows
+            ],
+        }
+
+    finally:
+        await db.close()
+
+
+# --------------------------------------------------
+# Top-selling products
+# --------------------------------------------------
+
+@mcp.tool()
+async def top_products(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: int = 5,
+) -> dict:
+    """
+    Find the best-selling products by quantity sold.
+    Also returns revenue generated by each product.
+    """
+
+    if limit < 1 or limit > 50:
+        raise ValueError("Limit must be between 1 and 50.")
+
+    start_date, end_date = validate_date_range(start_date, end_date)
+
+    query = """
+        SELECT
+            product,
+            SUM(quantity) AS units_sold,
+            SUM(total_amount) AS revenue
+        FROM sales
+        WHERE shop_id = ?
+    """
+
+    query, params = apply_filters(
+        query,
+        [SHOP_ID],
+        start_date,
+        end_date,
+    )
+
+    query += """
+        GROUP BY product
+        ORDER BY units_sold DESC
+        LIMIT ?
+    """
+
+    params.append(limit)
+
+    db = await get_db()
+
+    try:
+        cursor = await db.execute(query, params)
+        rows = await cursor.fetchall()
+
+        return {
+            "top_products": [
+                {
+                    "product": row["product"],
+                    "units_sold": row["units_sold"],
+                    "revenue": round(row["revenue"], 2),
+                }
+                for row in rows
+            ]
+        }
+
+    finally:
+        await db.close()
+
+
+# --------------------------------------------------
+# Server startup
+# --------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="stdio")
